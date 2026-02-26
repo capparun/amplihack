@@ -23,6 +23,7 @@ Usage:
     python -m amplihack.eval.long_horizon_memory --turns 100 --questions 20
     python -m amplihack.eval.long_horizon_memory --turns 1000 --questions 100
     python -m amplihack.eval.long_horizon_memory --sdk claude --grader-votes 5
+    python -m amplihack.eval.long_horizon_memory --turns 100 --questions 20 --parallel-workers 10
 """
 
 from __future__ import annotations
@@ -33,7 +34,9 @@ import logging
 import os
 import re
 import statistics
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -305,21 +308,33 @@ def _grade_multi_vote(
 ) -> list[DimensionScore]:
     """Grade with multiple votes and take median score per dimension.
 
-    Calls _grade_hybrid N times and returns the median score per dimension.
-    For N=1, this is equivalent to a single call (no overhead).
+    Calls _grade_hybrid N times concurrently and returns the median score per
+    dimension. For N=1, this is equivalent to a single call (no overhead).
+    When N>1, votes are submitted to a ThreadPoolExecutor for parallel execution.
     """
     if num_votes <= 1:
         return _grade_hybrid(question, actual_answer, dimensions, grader_model)
 
-    # Collect all vote results
+    # Collect all vote results using parallel execution
     all_votes: dict[str, list[float]] = {d: [] for d in dimensions}
     all_reasoning: dict[str, list[str]] = {d: [] for d in dimensions}
 
-    for _ in range(num_votes):
-        scores = _grade_hybrid(question, actual_answer, dimensions, grader_model)
-        for ds in scores:
-            all_votes[ds.dimension].append(ds.score)
-            all_reasoning[ds.dimension].append(ds.reasoning)
+    def _do_vote() -> list[DimensionScore]:
+        return _grade_hybrid(question, actual_answer, dimensions, grader_model)
+
+    with ThreadPoolExecutor(max_workers=num_votes) as executor:
+        futures = [executor.submit(_do_vote) for _ in range(num_votes)]
+        for future in futures:
+            try:
+                scores = future.result()
+                for ds in scores:
+                    all_votes[ds.dimension].append(ds.score)
+                    all_reasoning[ds.dimension].append(ds.reasoning)
+            except Exception as e:
+                logger.warning("Grading vote failed: %s", e)
+                for dim in dimensions:
+                    all_votes[dim].append(0.0)
+                    all_reasoning[dim].append(f"Vote failed: {e}")
 
     # Take median per dimension
     result: list[DimensionScore] = []
@@ -511,6 +526,11 @@ class LongHorizonMemoryEval:
         num_questions: Number of quiz questions (default 100)
         seed: Random seed for reproducibility (default 42)
         grader_votes: Number of grading votes per question (default 3)
+        parallel_workers: Number of parallel workers for question answering
+            and grading. Set to 1 for sequential execution (default 10, max 20).
+        flush_every: Flush agent memory every N turns during dialogue to cap
+            memory growth. 0 disables (default 0). Requires the agent to
+            expose a ``flush_memory()`` method (e.g. HierarchicalMemory).
 
     Example:
         >>> from amplihack.agents.goal_seeking.learning_agent import LearningAgent
@@ -526,11 +546,15 @@ class LongHorizonMemoryEval:
         num_questions: int = 100,
         seed: int = 42,
         grader_votes: int = 3,
+        parallel_workers: int = 10,
+        flush_every: int = 0,
     ):
         self.num_turns = num_turns
         self.num_questions = num_questions
         self.seed = seed
         self.grader_votes = max(1, grader_votes)
+        self.parallel_workers = max(1, min(20, parallel_workers))
+        self.flush_every = max(0, flush_every)
         self.ground_truth: GroundTruth | None = None
         self.questions: list[Question] = []
 
@@ -548,6 +572,10 @@ class LongHorizonMemoryEval:
     def run_dialogue(self, agent: Any, ground_truth: GroundTruth | None = None) -> float:
         """Feed all turns to the agent's learning method.
 
+        When ``flush_every > 0`` and the agent exposes ``flush_memory()``,
+        the memory connection is periodically recycled to cap in-process
+        cache growth without losing any persisted data.
+
         Args:
             agent: Agent with learn_from_content(content) method
             ground_truth: Override ground truth (uses self.ground_truth if None)
@@ -559,8 +587,17 @@ class LongHorizonMemoryEval:
         if gt is None:
             raise ValueError("Must call generate() first or pass ground_truth")
 
+        flush_every = self.flush_every
+        can_flush = flush_every > 0 and hasattr(agent, "flush_memory")
+        if flush_every > 0 and not can_flush:
+            logger.warning(
+                "flush_every=%d but agent has no flush_memory(); disabling periodic flush",
+                flush_every,
+            )
+
         start = time.time()
         total = len(gt.turns)
+        flushes = 0
 
         for i, turn in enumerate(gt.turns):
             if not turn.content or not turn.content.strip():
@@ -582,8 +619,27 @@ class LongHorizonMemoryEval:
                     turn.block_name,
                 )
 
+            # Periodic memory flush to cap cache growth
+            if can_flush and (i + 1) % flush_every == 0 and (i + 1) < total:
+                logger.info(
+                    "Flushing memory at turn %d/%d (flush #%d)",
+                    i + 1,
+                    total,
+                    flushes + 1,
+                )
+                try:
+                    agent.flush_memory()
+                except Exception as e:
+                    logger.warning("flush_memory failed at turn %d: %s", i + 1, e)
+                flushes += 1
+
         elapsed = time.time() - start
-        logger.info("Dialogue complete: %d turns in %.1fs", total, elapsed)
+        logger.info(
+            "Dialogue complete: %d turns in %.1fs (%d memory flushes)",
+            total,
+            elapsed,
+            flushes,
+        )
         return elapsed
 
     def evaluate(
@@ -593,6 +649,10 @@ class LongHorizonMemoryEval:
         grader_model: str = "",
     ) -> EvalReport:
         """Ask questions and grade responses.
+
+        When parallel_workers > 1, questions are answered and graded concurrently
+        using a ThreadPoolExecutor. Results are collected in original question order
+        to ensure deterministic output regardless of worker count.
 
         Args:
             agent: Agent with answer_question(question) method
@@ -606,53 +666,15 @@ class LongHorizonMemoryEval:
         if not qs:
             raise ValueError("Must call generate() first or pass questions")
 
-        results: list[EvalResult] = []
         q_start = time.time()
-        grade_total = 0.0
 
-        for i, q in enumerate(qs):
-            logger.info("Question %d/%d: %s", i + 1, len(qs), q.text[:60])
-
-            # Get agent's answer
-            try:
-                answer = agent.answer_question(q.text)
-                if isinstance(answer, tuple):
-                    answer = answer[0]  # Handle (answer, trace) tuple
-            except Exception as e:
-                logger.warning("Agent failed to answer: %s", e)
-                answer = f"Error: {e}"
-
-            # Grade the answer (hybrid deterministic + LLM, with multi-vote)
-            grade_start = time.time()
-            dimensions = q.scoring_dimensions or ["factual_accuracy"]
-            dim_scores = _grade_multi_vote(
-                q, answer, dimensions, grader_model, num_votes=self.grader_votes
-            )
-            grade_time = time.time() - grade_start
-            grade_total += grade_time
-
-            # Compute overall score as average of dimension scores
-            overall = sum(d.score for d in dim_scores) / len(dim_scores) if dim_scores else 0.0
-
-            result = EvalResult(
-                question_id=q.question_id,
-                question_text=q.text,
-                category=q.category,
-                expected_answer=q.expected_answer,
-                actual_answer=answer if isinstance(answer, str) else str(answer),
-                dimensions=dim_scores,
-                overall_score=overall,
-                grading_time_s=grade_time,
-            )
-            results.append(result)
-
-            logger.info(
-                "  Score: %.2f | Answer: %s",
-                overall,
-                (answer[:80] if isinstance(answer, str) else str(answer)[:80]) + "...",
-            )
+        if self.parallel_workers <= 1:
+            results = self._evaluate_sequential(qs, agent, grader_model)
+        else:
+            results = self._evaluate_parallel(qs, agent, grader_model)
 
         q_elapsed = time.time() - q_start
+        grade_total = sum(r.grading_time_s for r in results)
 
         # Build category breakdown
         categories: dict[str, list[EvalResult]] = {}
@@ -679,7 +701,7 @@ class LongHorizonMemoryEval:
             )
 
         # Get memory stats
-        mem_stats = {}
+        mem_stats: dict[str, Any] = {}
         try:
             mem_stats = agent.get_memory_stats()
         except Exception:
@@ -704,6 +726,125 @@ class LongHorizonMemoryEval:
             results=results,
             memory_stats=mem_stats,
         )
+
+    def _evaluate_sequential(
+        self,
+        qs: list[Question],
+        agent: Any,
+        grader_model: str,
+    ) -> list[EvalResult]:
+        """Evaluate questions sequentially (parallel_workers=1)."""
+        results: list[EvalResult] = []
+        for i, q in enumerate(qs):
+            logger.info("Question %d/%d: %s", i + 1, len(qs), q.text[:60])
+            result = self._answer_and_grade_one(i, q, agent, grader_model, len(qs))
+            results.append(result)
+        return results
+
+    def _evaluate_parallel(
+        self,
+        qs: list[Question],
+        agent: Any,
+        grader_model: str,
+    ) -> list[EvalResult]:
+        """Evaluate questions in parallel using ThreadPoolExecutor.
+
+        Each worker answers one question and grades the response. Results are
+        collected into an ordered list matching the original question order.
+        """
+        total = len(qs)
+        results: list[EvalResult | None] = [None] * total
+        completed = [0]
+        lock = threading.Lock()
+
+        logger.info(
+            "Starting parallel evaluation: %d questions, %d workers",
+            total,
+            self.parallel_workers,
+        )
+
+        def _worker(idx: int, q: Question) -> None:
+            result = self._answer_and_grade_one(idx, q, agent, grader_model, total)
+            results[idx] = result
+            with lock:
+                completed[0] += 1
+                logger.info(
+                    "Completed %d/%d questions (%.0f%%)",
+                    completed[0],
+                    total,
+                    completed[0] / total * 100,
+                )
+
+        with ThreadPoolExecutor(max_workers=self.parallel_workers) as executor:
+            futures = {executor.submit(_worker, i, q): i for i, q in enumerate(qs)}
+            for future in as_completed(futures):
+                exc = future.exception()
+                if exc is not None:
+                    idx = futures[future]
+                    logger.warning("Worker for question %d failed: %s", idx + 1, exc)
+                    q = qs[idx]
+                    results[idx] = EvalResult(
+                        question_id=q.question_id,
+                        question_text=q.text,
+                        category=q.category,
+                        expected_answer=q.expected_answer,
+                        actual_answer=f"Error: {exc}",
+                        dimensions=[
+                            DimensionScore(dimension=d, score=0.0, reasoning=f"Worker error: {exc}")
+                            for d in (q.scoring_dimensions or ["factual_accuracy"])
+                        ],
+                        overall_score=0.0,
+                        grading_time_s=0.0,
+                    )
+
+        return [r for r in results if r is not None]
+
+    def _answer_and_grade_one(
+        self,
+        idx: int,
+        q: Question,
+        agent: Any,
+        grader_model: str,
+        total: int,
+    ) -> EvalResult:
+        """Answer a single question and grade the response. Thread-safe."""
+        logger.info("Question %d/%d: %s", idx + 1, total, q.text[:60])
+
+        try:
+            answer = agent.answer_question(q.text)
+            if isinstance(answer, tuple):
+                answer = answer[0]
+        except Exception as e:
+            logger.warning("Agent failed to answer: %s", e)
+            answer = f"Error: {e}"
+
+        grade_start = time.time()
+        dimensions = q.scoring_dimensions or ["factual_accuracy"]
+        dim_scores = _grade_multi_vote(
+            q, answer, dimensions, grader_model, num_votes=self.grader_votes
+        )
+        grade_time = time.time() - grade_start
+
+        overall = sum(d.score for d in dim_scores) / len(dim_scores) if dim_scores else 0.0
+
+        result = EvalResult(
+            question_id=q.question_id,
+            question_text=q.text,
+            category=q.category,
+            expected_answer=q.expected_answer,
+            actual_answer=answer if isinstance(answer, str) else str(answer),
+            dimensions=dim_scores,
+            overall_score=overall,
+            grading_time_s=grade_time,
+        )
+
+        logger.info(
+            "  Score: %.2f | Answer: %s",
+            overall,
+            (answer[:80] if isinstance(answer, str) else str(answer)[:80]) + "...",
+        )
+
+        return result
 
     def run(self, agent: Any, grader_model: str = "") -> EvalReport:
         """Run the complete evaluation: generate, learn, quiz, grade.
@@ -882,6 +1023,19 @@ def main() -> None:
         help="Path to an existing memory DB directory to load instead of creating a new one. "
         "Copies the DB to the output directory before running.",
     )
+    parser.add_argument(
+        "--parallel-workers",
+        type=int,
+        default=10,
+        help="Number of parallel workers for question answering/grading (1=sequential, max 20, default: 10)",
+    )
+    parser.add_argument(
+        "--flush-every",
+        type=int,
+        default=100,
+        help="Flush agent memory every N turns to cap cache growth. "
+        "0 disables. Agent must expose flush_memory() (default: 100).",
+    )
 
     args = parser.parse_args()
 
@@ -971,6 +1125,8 @@ def main() -> None:
             num_questions=args.questions,
             seed=args.seed,
             grader_votes=args.grader_votes,
+            parallel_workers=args.parallel_workers,
+            flush_every=args.flush_every,
         )
 
         if args.skip_learning:
